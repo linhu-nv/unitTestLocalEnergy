@@ -26,7 +26,7 @@ void set_ham(std::string &ham_file) {
         pauli_mat23);
 }
 
-void test(std::string &ham_file, std::string &data_file) {
+/*void test(std::string &ham_file, std::string &data_file) {
     set_ham(ham_file);
 
     npy_cpp::NumpyCpp np;
@@ -61,7 +61,7 @@ void test(std::string &ham_file, std::string &data_file) {
 
     npy_cpp::check(np["res_eloc_batch"], res_eloc_batch, size_res_eloc_batch, "res_eloc_batch");
     free(res_eloc_batch);
-}
+}*/
 
 void test_bigInt(std::string &ham_file, std::string &data_file) {
     set_ham(ham_file);

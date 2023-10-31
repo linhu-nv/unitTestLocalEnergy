@@ -13,7 +13,7 @@ OPTIONS=--std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -arch=comput
 #OPTIONS=--std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -arch=compute_70 -code=sm_80 --ptxas-options=-v 
 #INCLUDES=-I/root/wuyangjun/cuCollections/include -I/opt/nvidia/hpc_sdk/Linux_x86_64/23.1/compilers/include/ -I./
 INCLUDES=-I./
-all: test test-bitarr
+all: test-bitarr
 
 cpu: ${CPU_SRC}
 	g++ -fPIC -shared -O3 $< -o ${LIBNAME}
@@ -38,7 +38,7 @@ test: ${TEST_GPU_SRC}
 	${NVCC} ${OPTIONS} test_coupled_states.cu -o gpu_test
 
 test-bitarr: ${TEST_GPU_SRC}
-	${NVCC} ${OPTIONS} -D BIT_ARRAY_OPT test_coupled_states.cu -o gpu_test_bitarray
+	${NVCC} ${OPTIONS} -D BIT_ARRAY_OPT test_coupled_states.cu -o gpu_test_bitarray -lineinfo -L/usr/local/cuda/lib64 -lnvToolsExt # -g -G
 
 clean:
 	rm *.o *.so -f

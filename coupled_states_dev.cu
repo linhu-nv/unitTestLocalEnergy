@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <utility>
+#include <nvToolsExt.h>
 
 #ifdef KV_MAP_OPT
 #include "kv_map.cuh"
@@ -349,39 +350,6 @@ void set_indices_ham_int_opt(
     float32 real_size = (size_g_idxs + size_g_coeffs + size_g_pauli_mat12 + size_g_pauli_mat23) / 1024.0 / 1024.0;
     printf("----set_indices_ham_int_opt bitarray in CPP_GPU----- real_size = %.4fMB\n", real_size);
 }
-#else
-void set_indices_ham_int_opt(
-    const int32 n_qubits,
-    const int64 K,
-    const int64 NK,
-    const int64 *idxs,
-    const coeff_dtype *coeffs,
-    const dtype *pauli_mat12,
-    const dtype *pauli_mat23)
-{
-    g_n_qubits = n_qubits;
-    // g_K = K;
-    g_NK = NK;
-
-    const size_t size_g_idxs = sizeof(int64) * (NK + 1);
-    const size_t size_g_coeffs = sizeof(coeff_dtype) * K;
-    const size_t size_g_pauli_mat12 = sizeof(dtype) * (n_qubits * NK);
-    const size_t size_g_pauli_mat23 = sizeof(dtype) * (n_qubits * K);
-
-    cudaMalloc(&g_idxs, size_g_idxs);
-    cudaMalloc(&g_coeffs, size_g_coeffs);
-    cudaMalloc(&g_pauli_mat12, size_g_pauli_mat12);
-    cudaMalloc(&g_pauli_mat23, size_g_pauli_mat23);
-    cudaCheckErrors("cudaMalloc failure");
-
-    cudaMemcpy(g_idxs, idxs, size_g_idxs, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_coeffs, coeffs, size_g_coeffs, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_pauli_mat12, pauli_mat12, size_g_pauli_mat12, cudaMemcpyHostToDevice);
-    cudaMemcpy(g_pauli_mat23, pauli_mat23, size_g_pauli_mat23, cudaMemcpyHostToDevice);
-    cudaCheckErrors("cudaMemcpy failure");
-    float32 real_size = (size_g_idxs + size_g_coeffs + size_g_pauli_mat12 + size_g_pauli_mat23) / 1024.0 / 1024.0;
-    printf("----set_indices_ham_int_opt in CPP_GPU----- real_size = %.4fMB\n", real_size);
-}
 #endif
 
 /**
@@ -527,112 +495,6 @@ __global__ void calculate_local_energy_kernel(
     // printf("tid: %d clks: %.3lf %.3lf %.3f %.3f\n", index, clks[0]/_sum, clks[1]/_sum, clks[2]/_sum, clks[3]/_sum);
 }
 
-template<int MAXN=32>
-__global__ void calculate_local_energy_bitarr_kernel(
-    const int32 num_uint32,
-    const int64 NK,
-    const int64 *idxs,
-    const coeff_dtype *coeffs,
-    const dtype *pauli_mat12,
-    const dtype *pauli_mat23,
-    const int64 batch_size,
-    const int64 batch_size_cur_rank,
-    const int64 ist,
-    const dtype *state_batch,
-    // const int64 *ks, // TODO: maybe overflow when qubit == 64
-    const uint64 *ks,
-    const psi_dtype *vs,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    const int32 N = num_uint32;
-    const int32 index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int32 stride = gridDim.x * blockDim.x;
-
-    float64 clks[4] = {0};
-    clock_t t_st, t_ed;
-    // loop all samples
-    for (int ii = index; ii < batch_size_cur_rank; ii+=stride) {
-        psi_dtype e_loc_real = 0, e_loc_imag = 0;
-        int64 i_base = 0;
-        for (int sid = 0; sid < NK; sid++) {
-            coeff_dtype coef = 0.0;
-
-            // t_st = clock();
-            int st = idxs[sid], ed = idxs[sid+1];
-            for (int i = st; i < ed; i++) {
-                // int _sum = 0;
-                // for (int ik = 0; ik < N; ik++) {
-                //     _sum += state_batch[ii*N+ik] & pauli_mat23[i_base+ik];
-                // }
-                int _sum = __popc(state_batch[ii*N] & pauli_mat23[i_base]);
-                if (MAXN == 64) {
-                    _sum += __popc(state_batch[ii*N+1] & pauli_mat23[i_base+1]);
-                }
-                // coef += ((-1)^(_sum)) * coeffs[i]; // pow_n?
-                const psi_dtype _sgn = (_sum % 2 == 0) ? 1 : -1;
-                coef += _sgn * coeffs[i];
-                i_base += N;
-            }
-            // printf("ii: %d coef: %lf\n", ii, coef);
-            // t_ed = clock();
-            // clks[0] += static_cast<float64>(t_ed - t_st);
-            // filter value < eps
-            if (FABS(coef) < eps) {
-                continue;
-            }
-
-            // t_st = clock();
-            // map state -> id
-            // uint64 id = 0;
-            // for (int ik = 0; ik < N; ik++) {
-            //     id += (state_batch[ii*N+ik] ^ pauli_mat12[j_base+ik])*tbl_pow2[ik];
-            // }
-            uint64 id = state_batch[ii*N] ^ pauli_mat12[sid*N];
-            if (MAXN == 64) {
-                id = ((uint64)(state_batch[ii*N+1] ^ pauli_mat12[sid*N+1]) << 32) | id;
-            }
-            // t_ed = clock();
-            // clks[1] += static_cast<float64>(t_ed - t_st);
-
-            // t_st = clock();
-            // binary find id among the sampled samples
-            // idx = binary_find(ks, id), [_ist, _ied) start from 0
-            int32 _ist = 0, _ied = batch_size, _imd = 0;
-            while (_ist < _ied) {
-                _imd = (_ist + _ied) / 2;
-                if (ks[_imd] == id) {
-                    // e_loc += coef * vs[_imid]
-                    e_loc_real += coef * vs[_imd * 2];
-                    e_loc_imag += coef * vs[_imd * 2 + 1];
-                    break;
-                }
-
-                if (ks[_imd] < id) {
-                    _ist = _imd + 1;
-                } else {
-                    _ied = _imd;
-                }
-            }
-            // t_ed = clock();
-            // clks[2] += static_cast<float64>(t_ed - t_st);
-        }
-
-        // t_st = clock();
-        // store the result number as return
-        // (a+bi)/(c+di) = (ac+bd)/(c^2+d^2) + (bc-ad)/(c^2+d^2)i
-        const psi_dtype a = e_loc_real, b = e_loc_imag;
-        const psi_dtype c = vs[(ist+ii)*2], d = vs[(ist+ii)*2+1];
-        const psi_dtype c2_d2 = c*c + d*d;
-        res_eloc_batch[ii*2  ] = (a*c + b*d) / c2_d2;
-        res_eloc_batch[ii*2+1] = -(a*d - b*c) / c2_d2;
-        // t_ed = clock();
-        // clks[3] += static_cast<float64>(t_ed - t_st);
-    }
-    // printf("tid: %d clks: %.1lf %.1lf %.1f %.1f\n", index, clks[0], clks[1], clks[2], clks[3]);
-    // float64 _sum = clks[0] + clks[1] + clks[2] + clks[3];
-    // printf("tid: %d clks: %.3lf %.3lf %.3f %.3f\n", index, clks[0]/_sum, clks[1]/_sum, clks[2]/_sum, clks[3]/_sum);
-}
 
 template<int TILE_SIZE=4, int BLK_SIZE=128>
 __global__ void calculate_local_energy_tile_kernel(
@@ -1244,136 +1106,10 @@ __global__ void calculate_local_energy_warp_tile_kernel(
     }
 }
 
-#ifdef KV_MAP_OPT
-template<typename Map>
-__global__ void calculate_local_energy_kvmap_kernel(
-    const int32 n_qubits,
-    const int64 NK,
-    const int64 *idxs,
-    const coeff_dtype *coeffs,
-    const dtype *pauli_mat12,
-    const dtype *pauli_mat23,
-    const int64 batch_size,
-    const int64 batch_size_cur_rank,
-    const int64 ist,
-    const dtype *state_batch,
-    const uint64_t *ks,
-    const psi_dtype *vs,
-    const float64 eps,
-    Map map_view,
-    psi_dtype *res_eloc_batch)
-{
-    const int32 N = n_qubits;
-    const int32 index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int32 stride = gridDim.x * blockDim.x;
 
-    // replace branch to calculate state -> id
-    __shared__ int64 tbl_pow2[MAX_NQUBITS];
-    tbl_pow2[0] = 1;
-    for (int i = 1; i < N; i++) {
-        tbl_pow2[i] = tbl_pow2[i-1] * 2;
-    }
-    int cnt_real = 0, cnt_ii = 0;
-
-    // loop all samples
-    // for (int ii = 0; ii < batch_size_cur_rank; ii++) {
-    for (int ii = index; ii < batch_size_cur_rank; ii+=stride) {
-        cnt_ii++;
-        psi_dtype e_loc_real = 0, e_loc_imag = 0;
-        int64 i_base = 0;
-        for (int sid = 0; sid < NK; sid++) {
-            coeff_dtype coef = 0.0;
-
-            int st = idxs[sid], ed = idxs[sid+1];
-            for (int i = st; i < ed; i++) {
-                int _sum = 0;
-                for (int ik = 0; ik < N; ik++) {
-                    _sum += state_batch[ii*N+ik] & pauli_mat23[i_base+ik];
-                }
-                // if (ii == 0 && index==0) printf("st:%d ed:%d; i: %d _sum: %d\n", st, ed, i, _sum);
-                // coef += ((-1)^(_sum)) * coeffs[i]; // pow_n?
-                const psi_dtype _sgn = (_sum % 2 == 0) ? 1 : -1;
-                coef += _sgn * coeffs[i];
-                i_base += N;
-            }
-
-            // filter value < eps
-            if (FABS(coef) < eps) {
-                continue;
-            }
-            // printf("ii: %d coef: %f\n", ii, coef);
-            // map state -> id
-            int64 j_base = sid * N;
-            int64 id = 0;
-            for (int ik = 0; ik < N; ik++) {
-                id += (state_batch[ii*N+ik] ^ pauli_mat12[j_base+ik])*tbl_pow2[ik];
-            }
-            
-            cnt_real++;
-            // kv_map find 
-            #ifdef CUSTOM_HASH
-            auto found = map_view.find(id);
-            #else
-            auto found = map_view.find(id, custom_hash{});
-            #endif
-            if (found != map_view.end()) {
-                e_loc_real += coef * vs[found->second * 2];
-                e_loc_imag += coef * vs[found->second * 2 + 1];
-            }
-            // binary find id among the sampled samples
-            // idx = binary_find(ks, id), [_ist, _ied) start from 0
-            // int32 _ist = 0, _ied = batch_size, _imd = 0;
-            // while (_ist < _ied) {
-            //     _imd = (_ist + _ied) / 2;
-            //     if (ks[_imd] == id) {
-            //         // e_loc += coef * vs[_imid]
-            //         e_loc_real += coef * vs[_imd * 2];
-            //         e_loc_imag += coef * vs[_imd * 2 + 1];
-            //         break;
-            //     }
-
-            //     if (ks[_imd] < id) {
-            //         _ist = _imd + 1;
-            //     } else {
-            //         _ied = _imd;
-            //     }
-            //     // int res = ks[_imd] < id;
-            //     // _ist = (res == 1) ? _imd + 1 : _ist;
-            //     // _ied = (res == 1) ? _ied : _imd;
-            // }
-            // printf("ii=%d e_loc_real=%f\n", ii, e_loc_real);
-        }
-
-        // store the result number as return
-        // (a+bi)/(c+di) = (ac+bd)/(c^2+d^2) + (bc-ad)/(c^2+d^2)i
-        const psi_dtype a = e_loc_real, b = e_loc_imag;
-        const psi_dtype c = vs[(ist+ii)*2], d = vs[(ist+ii)*2+1];
-        const psi_dtype c2_d2 = c*c + d*d;
-        res_eloc_batch[ii*2  ] = (a*c + b*d) / c2_d2;
-        // res_eloc_batch[ii*2+1] = (a*d - b*c) / c2_d2;
-        res_eloc_batch[ii*2+1] = -(a*d - b*c) / c2_d2;
-    }
-    // printf("tid:%d find iterator cnt: %d cnt_real: %d avg: %f cnt_ii: %d\n", index, cuco::cnts[index], cnt_real, cuco::cnts[index]/(float)cnt_real, cnt_ii);
-    // cuco::real_cnts[index] = cnt_real;
-    // __syncthreads();
-    // if (index == 0) {
-    //     float sum_cnt = 0, real_sum_cnt = 0;
-    //     for (int i = 0; i < batch_size_cur_rank; i++) {
-    //         sum_cnt += cuco::cnts[i];
-    //         real_sum_cnt += cuco::real_cnts[i];
-    //     }
-    //     // float avg_cnt = sum_cnt / real_sum_cnt;
-    //     float avg_ratio = sum_cnt / real_sum_cnt;
-    //     // if (index == 0) printf("avg_cnt: %f avg_ratio: %f\n", avg_cnt, avg_ratio);
-    //     if (index == 0) printf("avg_ratio: %f\n", avg_ratio);
-    // }
-    // cuco::cnts[index] = 0;
-    // cuco::real_cnts[index] = 0;
-}
-#endif
-
-__global__ void calculate_local_energy_kernel_bigInt(
-    const int32 n_qubits,
+template<int MAXN=64>
+__global__ void calculate_local_energy_kernel_bigInt_V1_bitarr_shm(
+    const int32 num_uint32,
     const int64 NK,
     const int64 *idxs,
     const coeff_dtype *coeffs,
@@ -1389,119 +1125,49 @@ __global__ void calculate_local_energy_kernel_bigInt(
     const float64 eps,
     psi_dtype *res_eloc_batch)
 {
-    const int32 N = n_qubits;
+    const int32 N = num_uint32;
     const int32 index = blockIdx.x * blockDim.x + threadIdx.x;
     const int32 stride = gridDim.x * blockDim.x;
+    int lane_id = threadIdx.x % 32;
+    __shared__ dtype sh_state [128*3];//TODO dynamic shared memory size;
 
-    // replace branch to calculate state -> id
-    __shared__ uint64 tbl_pow2[id_stride];
-    tbl_pow2[0] = 1;
-    for (int i = 1; i < id_stride; i++) {
-        tbl_pow2[i] = tbl_pow2[i-1] * 2;
-    }
-
-    // TODO
-    // uint64 big_id[id_width];
     uint64 big_id[ID_WIDTH];
 
     // loop all samples
-    for (int ii = index; ii < batch_size_cur_rank; ii+=stride) {
-        psi_dtype e_loc_real = 0, e_loc_imag = 0;
-        int64 i_base = 0;
-        for (int sid = 0; sid < NK; sid++) {
-            coeff_dtype coef = 0.0;
-
-            int st = idxs[sid], ed = idxs[sid+1];
-            for (int i = st; i < ed; i++) {
-                int _sum = 0;
-                for (int ik = 0; ik < N; ik++) {
-                    _sum += state_batch[ii*N+ik] & pauli_mat23[i_base+ik];
-                }
-                // coef += ((-1)^(_sum)) * coeffs[i]; // pow_n?
-                const psi_dtype _sgn = (_sum % 2 == 0) ? 1 : -1;
-                coef += _sgn * coeffs[i];
-                i_base += N;
-            }
-
-            // filter value < eps
-            if (FABS(coef) < eps) {
-                continue;
-            }
-            // printf("ii: %d coef: %f\n", ii, coef);
-            // map state -> id
-            int64 j_base = sid * N;
-            _state2id_huge_fuse(&state_batch[ii*N], &pauli_mat12[j_base], N, id_width, id_stride, tbl_pow2, big_id);
-
-            // binary find id among the sampled samples
-            // idx = binary_find(ks, id), [_ist, _ied) start from 0
-            int32 _ist = 0, _ied = batch_size, res = 0xffff;
-            psi_dtype psi_real = 0., psi_imag = 0.;
-            binary_find_bigInt(_ist, _ied, ks, vs, id_width, big_id, &psi_real, &psi_imag, &res);
-            e_loc_real += coef * psi_real;
-            e_loc_imag += coef * psi_imag;
-            // printf("ii=%d e_loc_real=%f\n", ii, e_loc_real);
+    for (int ii = index; ii < (batch_size_cur_rank+31)/32*32; ii+=stride) {
+        //__syncwarp();
+        int active_thread_num = batch_size_cur_rank - ((ii >> 5) << 5);
+        active_thread_num = (active_thread_num > 32) ? 32 : active_thread_num;
+        int read_base_off = ((ii >> 5) << 5)*N;
+        int write_base_off = (threadIdx.x-lane_id)*N;
+        for (int idx = lane_id; idx < active_thread_num*N; idx += 32) {
+            sh_state[write_base_off + idx] = state_batch[read_base_off + idx];
         }
-
-        // store the result number as return
-        // (a+bi)/(c+di) = (ac+bd)/(c^2+d^2) + (bc-ad)/(c^2+d^2)i
-        const psi_dtype a = e_loc_real, b = e_loc_imag;
-        const psi_dtype c = vs[(ist+ii)*2], d = vs[(ist+ii)*2+1];
-        const psi_dtype c2_d2 = c*c + d*d;
-        res_eloc_batch[ii*2  ] = (a*c + b*d) / c2_d2;
-        // res_eloc_batch[ii*2+1] = (a*d - b*c) / c2_d2;
-        res_eloc_batch[ii*2+1] = -(a*d - b*c) / c2_d2;
-    }
-}
-
-// find coupled state first.
-// if don't exist we just calculate next coupled state and drop the coef calculation
-__global__ void calculate_local_energy_kernel_bigInt_V1(
-    const int32 n_qubits,
-    const int64 NK,
-    const int64 *idxs,
-    const coeff_dtype *coeffs,
-    const dtype *pauli_mat12,
-    const dtype *pauli_mat23,
-    const int64 batch_size,
-    const int64 batch_size_cur_rank,
-    const int64 ist,
-    const dtype *state_batch,
-    const uint64 *ks,
-    const int64 id_width,
-    const psi_dtype *vs,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    const int32 N = n_qubits;
-    const int32 index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int32 stride = gridDim.x * blockDim.x;
-
-    // replace branch to calculate state -> id
-    __shared__ uint64 tbl_pow2[id_stride];
-    tbl_pow2[0] = 1;
-    for (int i = 1; i < id_stride; i++) {
-        tbl_pow2[i] = tbl_pow2[i-1] * 2;
-    }
-
-    // TODO
-    // uint64 big_id[id_width];
-    uint64 big_id[ID_WIDTH];
-
-    // loop all samples
-    // for (int ii = 0; ii < batch_size_cur_rank; ii++) {
-    for (int ii = index; ii < batch_size_cur_rank; ii+=stride) {
+        //__threadfence();
+        read_base_off -= (threadIdx.x-lane_id)*N;
+        if (ii >= batch_size_cur_rank)
+            continue;
         psi_dtype e_loc_real = 0, e_loc_imag = 0;
-        // int64 i_base = 0;
         for (int sid = 0; sid < NK; sid++) {
             psi_dtype psi_real = 0., psi_imag = 0.;
             // map state -> id
-            int64 j_base = sid * N;
+            // int64 j_base = sid * N;
             int res = 0xffff;
             // int64 id = 0;
             // for (int ik = 0; ik < N; ik++) {
             //     id += (state_batch[ii*N+ik] ^ pauli_mat12[j_base+ik])*tbl_pow2[ik];
             // }
-            _state2id_huge_fuse(&state_batch[ii*N], &pauli_mat12[j_base], N, id_width, id_stride, tbl_pow2, big_id);
+            // _state2id_huge_fuse(&state_batch[ii*N], &pauli_mat12[j_base], N, id_width, id_stride, tbl_pow2, big_id);
+            big_id[0] = sh_state[ii*N - read_base_off] ^ pauli_mat12[sid*N];
+            if (MAXN >= 64) {
+                big_id[0] = ((uint64)(sh_state[ii*N+1 - read_base_off] ^ pauli_mat12[sid*N+1]) << 32) | big_id[0];
+            }
+            if (MAXN >= 96) {
+                big_id[1] = sh_state[ii*N+2 - read_base_off] ^ pauli_mat12[sid*N+2];
+            }
+            if (MAXN >= 128) {
+                big_id[1] = ((uint64)(sh_state[ii*N+3 - read_base_off] ^ pauli_mat12[sid*N+3]) << 32) | big_id[1];
+            }
             // binary find id among the sampled samples
             // idx = binary_find(ks, id), [_ist, _ied) start from 0
             int32 _ist = 0, _ied = batch_size;
@@ -1517,10 +1183,20 @@ __global__ void calculate_local_energy_kernel_bigInt_V1(
 
             int st = idxs[sid], ed = idxs[sid+1];
             for (int i = st; i < ed; i++) {
-                int _sum = 0;
-                for (int ik = 0; ik < N; ik++) {
-                    // _sum += state_batch[ii*N+ik] & pauli_mat23[i_base+ik];
-                    _sum += state_batch[ii*N+ik] & pauli_mat23[i*N+ik];
+                // int _sum = 0;
+                // for (int ik = 0; ik < N; ik++) {
+                //     // _sum += state_batch[ii*N+ik] & pauli_mat23[i_base+ik];
+                //     _sum += state_batch[ii*N+ik] & pauli_mat23[i*N+ik];
+                // }
+                int _sum = __popc(sh_state[ii*N - read_base_off] & pauli_mat23[i*N]);
+                if (MAXN >= 64) {
+                    _sum += __popc(sh_state[ii*N+1 - read_base_off] & pauli_mat23[i*N+1]);
+                }
+                if (MAXN >= 96) {
+                    _sum += __popc(sh_state[ii*N+2 - read_base_off] & pauli_mat23[i*N+2]);
+                }
+                if (MAXN >= 128) {
+                    _sum += __popc(sh_state[ii*N+3 - read_base_off] & pauli_mat23[i*N+3]);
                 }
                 // if (ii == 0 && index==0) printf("st:%d ed:%d; i: %d _sum: %d\n", st, ed, i, _sum);
                 // coef += ((-1)^(_sum)) * coeffs[i]; // pow_n?
@@ -1528,9 +1204,7 @@ __global__ void calculate_local_energy_kernel_bigInt_V1(
                 coef += _sgn * coeffs[i];
                 // i_base += N;
             }
-
-            if (FABS(coef) < eps) continue;
-
+            // if (FABS(coef) < eps) continue;
             e_loc_real += coef * psi_real;
             e_loc_imag += coef * psi_imag;
 
@@ -1635,109 +1309,6 @@ __global__ void calculate_local_energy_kernel_bigInt_V1_bitarr(
                 // i_base += N;
             }
             // if (FABS(coef) < eps) continue;
-            e_loc_real += coef * psi_real;
-            e_loc_imag += coef * psi_imag;
-
-            // printf("ii: %d coef: %f\n", ii, coef);
-            // printf("ii=%d e_loc_real=%f\n", ii, e_loc_real);
-        }
-
-        // store the result number as return
-        // (a+bi)/(c+di) = (ac+bd)/(c^2+d^2) + (bc-ad)/(c^2+d^2)i
-        const psi_dtype a = e_loc_real, b = e_loc_imag;
-        const psi_dtype c = vs[(ist+ii)*2], d = vs[(ist+ii)*2+1];
-        const psi_dtype c2_d2 = c*c + d*d;
-        res_eloc_batch[ii*2  ] = (a*c + b*d) / c2_d2;
-        // res_eloc_batch[ii*2+1] = (a*d - b*c) / c2_d2;
-        res_eloc_batch[ii*2+1] = -(a*d - b*c) / c2_d2;
-    }
-}
-
-template<int MAXN=64>
-__global__ void calculate_local_energy_kernel_bigInt_bitarr(
-    const int32 num_uint32,
-    const int64 NK,
-    const int64 *idxs,
-    const coeff_dtype *coeffs,
-    const dtype *pauli_mat12,
-    const dtype *pauli_mat23,
-    const int64 batch_size,
-    const int64 batch_size_cur_rank,
-    const int64 ist,
-    const dtype *state_batch,
-    const uint64 *ks,
-    const int64 id_width,
-    const psi_dtype *vs,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    const int32 N = num_uint32;
-    const int32 index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int32 stride = gridDim.x * blockDim.x;
-
-    uint64 big_id[ID_WIDTH];
-
-    // loop all samples
-    for (int ii = index; ii < batch_size_cur_rank; ii+=stride) {
-        psi_dtype e_loc_real = 0, e_loc_imag = 0;
-        for (int sid = 0; sid < NK; sid++) {
-            psi_dtype psi_real = 0., psi_imag = 0.;
-
-            coeff_dtype coef = 0.0;
-
-            int st = idxs[sid], ed = idxs[sid+1];
-            for (int i = st; i < ed; i++) {
-                // int _sum = 0;
-                // for (int ik = 0; ik < N; ik++) {
-                //     // _sum += state_batch[ii*N+ik] & pauli_mat23[i_base+ik];
-                //     _sum += state_batch[ii*N+ik] & pauli_mat23[i*N+ik];
-                // }
-                int _sum = __popc(state_batch[ii*N] & pauli_mat23[i*N]);
-                if (MAXN >= 64) {
-                    _sum += __popc(state_batch[ii*N+1] & pauli_mat23[i*N+1]);
-                }
-                if (MAXN >= 96) {
-                    _sum += __popc(state_batch[ii*N+2] & pauli_mat23[i*N+2]);
-                }
-                if (MAXN >= 128) {
-                    _sum += __popc(state_batch[ii*N+3] & pauli_mat23[i*N+3]);
-                }
-                // if (ii == 0 && index==0) printf("st:%d ed:%d; i: %d _sum: %d\n", st, ed, i, _sum);
-                // coef += ((-1)^(_sum)) * coeffs[i]; // pow_n?
-                const psi_dtype _sgn = (_sum % 2 == 0) ? 1 : -1;
-                coef += _sgn * coeffs[i];
-            }
-            if (FABS(coef) < eps) continue;
-
-            // map state -> id
-            // int64 j_base = sid * N;
-            int res = 0xffff;
-            // int64 id = 0;
-            // for (int ik = 0; ik < N; ik++) {
-            //     id += (state_batch[ii*N+ik] ^ pauli_mat12[j_base+ik])*tbl_pow2[ik];
-            // }
-            // _state2id_huge_fuse(&state_batch[ii*N], &pauli_mat12[j_base], N, id_width, id_stride, tbl_pow2, big_id);
-            big_id[0] = state_batch[ii*N] ^ pauli_mat12[sid*N];
-            if (MAXN >= 64) {
-                big_id[0] = ((uint64)(state_batch[ii*N+1] ^ pauli_mat12[sid*N+1]) << 32) | big_id[0];
-            }
-            if (MAXN >= 96) {
-                big_id[1] = state_batch[ii*N+2] ^ pauli_mat12[sid*N+2];
-            }
-            if (MAXN >= 128) {
-                big_id[1] = ((uint64)(state_batch[ii*N+3] ^ pauli_mat12[sid*N+3]) << 32) | big_id[1];
-            }
-            // binary find id among the sampled samples
-            // idx = binary_find(ks, id), [_ist, _ied) start from 0
-            int32 _ist = 0, _ied = batch_size;
-            binary_find_bigInt(_ist, _ied, ks, vs, id_width, big_id, &psi_real, &psi_imag, &res);
-            // printf("index: %d big_id[0]: %llu res: %d\n", index, big_id[0], res);
-
-            // don't find this coupled state in current samples
-            if (res != 0) {
-                continue;
-            }
-
             e_loc_real += coef * psi_real;
             e_loc_imag += coef * psi_imag;
 
@@ -1909,558 +1480,6 @@ __global__ void calculate_local_energy_kernel_V1(
     }
 }
 
-#ifdef KV_MAP_OPT
-/**
- * Calculate local energy by fusing Hxx' and summation interface (for Julia).
- * Current rank only calculate _states[ist, ied) and ist start from 0
- * Args:
- *     batch_size: total samples number
- *     _state: samples
- *     k_idxs: ordered samples origin index used for permutation
- *     ks: map samples into id::Int Notion: n_qubits <= 64!
- *     vs: samples -> psis (ks -> vs)
- *     rank: MPI rank
- *     eps: dropout coeff < eps
- * Returns:
- *     res_eloc_batch: save the local energy result with complex value,
- *                     res_eloc_batch(1/2,:) represent real/imag
- **/
-void calculate_local_energy(
-    const int64 batch_size,
-    const int64 *_states,
-    const int64 ist,
-    const int64 ied,
-    const int64 *k_idxs, // unused now
-    const uint64 *ks,
-    const psi_dtype *vs,
-    const int64 rank,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    const int32 n_qubits = g_n_qubits;
-    const int64 *idxs = g_idxs;
-    const coeff_dtype *coeffs = g_coeffs;
-    const dtype *pauli_mat12 = g_pauli_mat12;
-    const dtype *pauli_mat23 = g_pauli_mat23;
-
-    const int64 batch_size_cur_rank = ied - ist;
-    const int32 N = g_n_qubits;
-
-    // transform _states{int64} into states{dtype} and map {+1,-1} to {+1,0}
-    // assume states id is ordered after unique sampling, for using binary find
-    const int64 target_value = -1;
-    const size_t size_states = sizeof(dtype) * batch_size * N;
-    dtype *states = NULL, *d_states = NULL;
-    states = (dtype *)malloc(size_states);
-    memset(states, 0, size_states); // init 0
-    for (int i = 0; i < batch_size; i++) {
-        for (int j = 0; j < N; j++) {
-            if (_states[i*N+j] != target_value) {
-                states[i*N+j] = 1;
-            }
-        }
-    }
-
-    const size_t size_ks = sizeof(uint64) * batch_size;
-    const size_t size_vs = sizeof(psi_dtype) * batch_size * 2;
-    const size_t size_res_eloc_batch = sizeof(psi_dtype) * batch_size_cur_rank * 2;
-    uint64 *d_ks = NULL;
-    psi_dtype *d_vs = NULL;
-    psi_dtype *d_res_eloc_batch = NULL;
-
-    cudaMalloc(&d_ks, size_ks);
-    cudaMalloc(&d_vs, size_vs);
-    cudaMalloc(&d_states, size_states);
-    cudaMalloc(&d_res_eloc_batch, size_res_eloc_batch);
-    cudaCheckErrors("cudaMalloc failure");
-    cudaMemcpy(d_ks, ks, size_ks, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vs, vs, size_vs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_states, states, size_states, cudaMemcpyHostToDevice);
-    cudaCheckErrors("cudaMemcpy failure");
-    
-    using Key = int64;
-    using Value = int64;
-    // Compute capacity based on a 70% load factor
-    auto constexpr load_factor = 0.1;
-    Key constexpr empty_key_sentinel = -1;
-    Value constexpr empty_value_sentinel = -1;
-    // insert (key,value) into map
-    // auto constexpr block_size = 256;
-    // auto const grid_size      = (batch_size + block_size - 1) / block_size;
-    auto kv_map = create_static_map<Key, Value>(
-        ks,
-        // vs,
-        batch_size,
-        empty_key_sentinel,
-        empty_value_sentinel,
-        load_factor
-    );
-    auto device_find_view = kv_map->get_device_view();
-
-    // int nthreads = 256;
-    const int nthreads = 128;
-    const int nblocks = batch_size_cur_rank / nthreads + ((batch_size_cur_rank%nthreads) != 0);
-    // if (nblocks * nthreads < batch_size_cur_rank) {
-    //     puts("ERROR: nblocks * nthreads < batch_size_cur_rank");
-    //     return;
-    // }
-    calculate_local_energy_kvmap_kernel<<<nblocks, nthreads>>>(
-        n_qubits,
-        g_NK,
-        idxs,
-        coeffs,
-        pauli_mat12,
-        pauli_mat23,
-        batch_size,
-        batch_size_cur_rank,
-        ist,
-        &d_states[ist*N],
-        d_ks,
-        d_vs,
-        eps,
-        device_find_view,
-        d_res_eloc_batch);
-    cudaCheckErrors("kernel launch failure");
-    cudaDeviceSynchronize();
-    cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
-    cudaCheckErrors("cudaMemcpy failure");
-
-    free(states);
-    cudaFree(d_states);
-    cudaFree(d_res_eloc_batch);
-    cudaFree(d_ks);
-    cudaFree(d_vs);
-}
-#elif defined(TILE_OPT)
-
-void calculate_local_energy(
-    const int64 batch_size,
-    const int64 *_states,
-    const int64 ist,
-    const int64 ied,
-    const int64 *k_idxs, // unused now
-    const uint64 *ks,
-    const psi_dtype *vs,
-    const int64 rank,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    printf("TILE_OPT\n");
-    const int32 n_qubits = g_n_qubits;
-    const int64 *idxs = g_idxs;
-    const coeff_dtype *coeffs = g_coeffs;
-    const dtype *pauli_mat12 = g_pauli_mat12;
-    const dtype *pauli_mat23 = g_pauli_mat23;
-
-    const int64 batch_size_cur_rank = ied - ist;
-    const int32 N = g_n_qubits;
-
-    // transform _states{int64} into states{dtype} and map {+1,-1} to {+1,0}
-    // assume states id is ordered after unique sampling, for using binary find
-    const int64 target_value = -1;
-    const size_t size_states = sizeof(dtype) * batch_size * N;
-    dtype *states = NULL, *d_states = NULL;
-    states = (dtype *)malloc(size_states);
-    memset(states, 0, size_states); // init 0
-    for (int i = 0; i < batch_size; i++) {
-        for (int j = 0; j < N; j++) {
-            if (_states[i*N+j] != target_value) {
-                states[i*N+j] = 1;
-            }
-        }
-    }
-
-    const size_t size_ks = sizeof(uint64) * batch_size;
-    const size_t size_vs = sizeof(psi_dtype) * batch_size * 2;
-    const size_t size_res_eloc_batch = sizeof(psi_dtype) * batch_size_cur_rank * 2;
-    uint64 *d_ks = NULL;
-    psi_dtype *d_vs = NULL;
-    psi_dtype *d_res_eloc_batch = NULL;
-
-    cudaMalloc(&d_ks, size_ks);
-    cudaMalloc(&d_vs, size_vs);
-    cudaMalloc(&d_states, size_states);
-    cudaMalloc(&d_res_eloc_batch, size_res_eloc_batch);
-    cudaCheckErrors("cudaMalloc failure");
-    cudaMemcpy(d_ks, ks, size_ks, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vs, vs, size_vs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_states, states, size_states, cudaMemcpyHostToDevice);
-    cudaCheckErrors("cudaMemcpy failure");
-
-    // int nthreads = 256;
-    const int tile_size = 4;
-    const int nthreads = 128;
-    const int nblocks = batch_size_cur_rank / (nthreads * tile_size) + ((batch_size_cur_rank % (nthreads * tile_size)) != 0);
-    // if (nblocks * nthreads < batch_size_cur_rank) {
-    //     puts("ERROR: nblocks * nthreads < batch_size_cur_rank");
-    //     return;
-    // }
-
-    calculate_local_energy_tile_kernel<tile_size, nthreads><<<nblocks, nthreads>>>(
-        n_qubits,
-        g_NK,
-        idxs,
-        coeffs,
-        pauli_mat12,
-        pauli_mat23,
-        batch_size,
-        batch_size_cur_rank,
-        ist,
-        &d_states[ist*N],
-        d_ks,
-        d_vs,
-        eps,
-        d_res_eloc_batch);
-    cudaCheckErrors("kernel launch failure");
-    cudaDeviceSynchronize();
-    cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
-    cudaCheckErrors("cudaMemcpy failure");
-
-    free(states);
-    cudaFree(d_states);
-    cudaFree(d_res_eloc_batch);
-    cudaFree(d_ks);
-    cudaFree(d_vs);
-}
-#elif defined(WARP_TILE_OPT)
-
-void calculate_local_energy(
-    const int64 batch_size,
-    const int64 *_states,
-    const int64 ist,
-    const int64 ied,
-    const int64 *k_idxs, // unused now
-    const uint64 *ks,
-    const psi_dtype *vs,
-    const int64 rank,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    printf("WARP_TILE_OPT\n");
-    Timer timer[4];
-    timer[3].start();
-    const int32 n_qubits = g_n_qubits;
-    const int64 *idxs = g_idxs;
-    const coeff_dtype *coeffs = g_coeffs;
-    const dtype *pauli_mat12 = g_pauli_mat12;
-    const dtype *pauli_mat23 = g_pauli_mat23;
-
-    const int64 batch_size_cur_rank = ied - ist;
-    const int32 N = g_n_qubits;
-
-    // transform _states{int64} into states{dtype} and map {+1,-1} to {+1,0}
-    // assume states id is ordered after unique sampling, for using binary find
-    const int64 target_value = -1;
-    const size_t size_states = sizeof(dtype) * batch_size * N;
-    dtype *states = NULL, *d_states = NULL;
-    states = (dtype *)malloc(size_states);
-    memset(states, 0, size_states); // init 0
-    for (int i = 0; i < batch_size; i++) {
-        for (int j = 0; j < N; j++) {
-            if (_states[i*N+j] != target_value) {
-                states[i*N+j] = 1;
-            }
-        }
-    }
-
-    const size_t size_ks = sizeof(uint64) * batch_size;
-    const size_t size_vs = sizeof(psi_dtype) * batch_size * 2;
-    const size_t size_res_eloc_batch = sizeof(psi_dtype) * batch_size_cur_rank * 2;
-    uint64 *d_ks = NULL;
-    psi_dtype *d_vs = NULL;
-    psi_dtype *d_res_eloc_batch = NULL;
-
-    cudaMalloc(&d_ks, size_ks);
-    cudaMalloc(&d_vs, size_vs);
-    cudaMalloc(&d_states, size_states);
-    cudaMalloc(&d_res_eloc_batch, size_res_eloc_batch);
-    cudaCheckErrors("cudaMalloc failure");
-    cudaMemcpy(d_ks, ks, size_ks, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vs, vs, size_vs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_states, states, size_states, cudaMemcpyHostToDevice);
-    cudaCheckErrors("cudaMemcpy failure");
-
-    // int nthreads = 256;
-    // const int tile_size = 1;
-    // const int tile_size = 4;
-    // const int tile_size = 8;
-    // const int tile_size = 16;
-    // const int tile_size = 32;
-    // const int tile_size = 64;
-    const int tile_size = 128;
-    const int nthreads = 128;
-    // const int nthreads = 256;
-    // const int nthreads = 64;
-    const int warp_size = 32;
-    const int warp_num = nthreads / warp_size;
-    const int nblocks = batch_size_cur_rank / (warp_num*tile_size) + ((batch_size_cur_rank % (warp_num*tile_size)) != 0);
-    // if (nblocks * nthreads < batch_size_cur_rank) {
-    //     puts("ERROR: nblocks * nthreads < batch_size_cur_rank");
-    //     return;
-    // }
-    timer[2].start();
-    if (n_qubits <= 32) {
-        calculate_local_energy_warp_tile_kernel<32, tile_size, nthreads, warp_size><<<nblocks, nthreads>>>(
-            n_qubits,
-            g_NK,
-            idxs,
-            coeffs,
-            pauli_mat12,
-            pauli_mat23,
-            batch_size,
-            batch_size_cur_rank,
-            ist,
-            &d_states[ist*N],
-            d_ks,
-            d_vs,
-            eps,
-            d_res_eloc_batch);
-    } else if (n_qubits <= 64) {
-        calculate_local_energy_warp_tile_kernel<64, tile_size, nthreads, warp_size><<<nblocks, nthreads>>>(
-            n_qubits,
-            g_NK,
-            idxs,
-            coeffs,
-            pauli_mat12,
-            pauli_mat23,
-            batch_size,
-            batch_size_cur_rank,
-            ist,
-            &d_states[ist*N],
-            d_ks,
-            d_vs,
-            eps,
-            d_res_eloc_batch);
-    } else {
-        printf("Error: only support n_qubits <= 64\n");
-    }
-    cudaCheckErrors("kernel launch failure");
-    cudaDeviceSynchronize();
-    cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
-    cudaCheckErrors("cudaMemcpy failure");
-    timer[2].stop("local_energy_kernel");
-
-
-    free(states);
-    cudaFree(d_states);
-    cudaFree(d_res_eloc_batch);
-    cudaFree(d_ks);
-    cudaFree(d_vs);
-    timer[3].stop("Cuda calculate_local_energy");
-
-}
-#elif defined(BIT_ARRAY_OPT)
-void calculate_local_energy(
-    const int64 batch_size,
-    const int64 *_states,
-    const int64 ist,
-    const int64 ied,
-    const int64 *k_idxs, // unused now
-    const uint64 *ks,
-    const psi_dtype *vs,
-    const int64 rank,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    printf("BIT_ARRAY_OPT\n");
-    Timer timer[4];
-    timer[3].start();
-    const int32 n_qubits = g_n_qubits;
-    const int64 *idxs = g_idxs;
-    const coeff_dtype *coeffs = g_coeffs;
-    const dtype *pauli_mat12 = g_pauli_mat12;
-    const dtype *pauli_mat23 = g_pauli_mat23;
-
-    const int64 batch_size_cur_rank = ied - ist;
-    timer[0].start();
-    auto ret = convert2bitarray_batch(_states, batch_size, g_n_qubits);
-    timer[0].stop("convert2bitarray_batch");
-    const int num_uint32 = ret.first;
-    uint32_t *states = ret.second;
-    const size_t size_states = sizeof(uint32_t) * batch_size * num_uint32;
-    const int32 N = num_uint32;
-    // print_mat(_states, batch_size, g_n_qubits, "states");
-    // print_mat_bit(states, batch_size, num_uint32, "states_bitarr");
-
-    // timer[1].start();
-    const size_t size_ks = sizeof(uint64_t) * batch_size;
-    const size_t size_vs = sizeof(psi_dtype) * batch_size * 2;
-    const size_t size_res_eloc_batch = sizeof(psi_dtype) * batch_size_cur_rank * 2;
-    uint64_t *d_ks = NULL;
-    dtype *d_states = NULL;
-    psi_dtype *d_vs = NULL;
-    psi_dtype *d_res_eloc_batch = NULL;
-
-    cudaMalloc(&d_ks, size_ks);
-    cudaMalloc(&d_vs, size_vs);
-    cudaMalloc(&d_states, size_states);
-    cudaMalloc(&d_res_eloc_batch, size_res_eloc_batch);
-    cudaCheckErrors("cudaMalloc failure");
-    cudaMemcpy(d_ks, ks, size_ks, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vs, vs, size_vs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_states, states, size_states, cudaMemcpyHostToDevice);
-    cudaCheckErrors("cudaMemcpy failure");
-    // timer[1].stop("cuda_malloc_memcpy");
-
-    timer[2].start();
-    // int nthreads = 256;
-    const int nthreads = 128;
-    const int nblocks = batch_size_cur_rank / nthreads + ((batch_size_cur_rank%nthreads) != 0);
-    if (n_qubits <= 32) {
-        calculate_local_energy_bitarr_kernel<32><<<nblocks, nthreads>>>(
-            num_uint32,
-            g_NK,
-            idxs,
-            coeffs,
-            pauli_mat12,
-            pauli_mat23,
-            batch_size,
-            batch_size_cur_rank,
-            ist,
-            &d_states[ist*N],
-            d_ks,
-            d_vs,
-            eps,
-            d_res_eloc_batch);
-    } else if (n_qubits <= 64) {
-        calculate_local_energy_bitarr_kernel<64><<<nblocks, nthreads>>>(
-            num_uint32,
-            g_NK,
-            idxs,
-            coeffs,
-            pauli_mat12,
-            pauli_mat23,
-            batch_size,
-            batch_size_cur_rank,
-            ist,
-            &d_states[ist*N],
-            d_ks,
-            d_vs,
-            eps,
-            d_res_eloc_batch);
-    } else {
-        printf("Error: only support n_qubits <= 64\n");
-    }
-
-    cudaCheckErrors("kernel launch failure");
-    cudaDeviceSynchronize();
-    cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
-    cudaCheckErrors("cudaMemcpy failure");
-    timer[2].stop("local_energy_kernel");
-
-    free(states);
-    cudaFree(d_states);
-    cudaFree(d_res_eloc_batch);
-    cudaFree(d_ks);
-    cudaFree(d_vs);
-    timer[3].stop("Cuda calculate_local_energy");
-}
-#else
-void calculate_local_energy(
-    const int64 batch_size,
-    const int64 *_states,
-    const int64 ist,
-    const int64 ied,
-    const int64 *k_idxs, // unused now
-    // const int64 *ks,
-    const uint64 *ks,
-    const psi_dtype *vs,
-    const int64 rank,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    Timer timer[4];
-    timer[3].start();
-    printf("ORG\n");
-    const int32 n_qubits = g_n_qubits;
-    const int64 *idxs = g_idxs;
-    const coeff_dtype *coeffs = g_coeffs;
-    const dtype *pauli_mat12 = g_pauli_mat12;
-    const dtype *pauli_mat23 = g_pauli_mat23;
-
-    const int64 batch_size_cur_rank = ied - ist;
-    const int32 N = g_n_qubits;
-
-    timer[0].start();
-    // transform _states{int64} into states{dtype} and map {+1,-1} to {+1,0}
-    // assume states id is ordered after unique sampling, for using binary find
-    const int64 target_value = -1;
-    const size_t size_states = sizeof(dtype) * batch_size * N;
-    dtype *states = NULL, *d_states = NULL;
-    states = (dtype *)malloc(size_states);
-    memset(states, 0, size_states); // init 0
-    for (int i = 0; i < batch_size; i++) {
-        for (int j = 0; j < N; j++) {
-            if (_states[i*N+j] != target_value) {
-                states[i*N+j] = 1;
-            }
-        }
-    }
-    timer[0].stop("convert2bitarray_batch");
-
-    const size_t size_ks = sizeof(uint64) * batch_size;
-    const size_t size_vs = sizeof(psi_dtype) * batch_size * 2;
-    const size_t size_res_eloc_batch = sizeof(psi_dtype) * batch_size_cur_rank * 2;
-    uint64 *d_ks = NULL;
-    psi_dtype *d_vs = NULL;
-    psi_dtype *d_res_eloc_batch = NULL;
-
-    cudaMalloc(&d_ks, size_ks);
-    cudaMalloc(&d_vs, size_vs);
-    cudaMalloc(&d_states, size_states);
-    cudaMalloc(&d_res_eloc_batch, size_res_eloc_batch);
-    cudaCheckErrors("cudaMalloc failure");
-    cudaMemcpy(d_ks, ks, size_ks, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vs, vs, size_vs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_states, states, size_states, cudaMemcpyHostToDevice);
-    cudaCheckErrors("cudaMemcpy failure");
-
-    timer[2].start();
-    // int nthreads = 256;
-    const int nthreads = 128;
-    const int nblocks = batch_size_cur_rank / nthreads + ((batch_size_cur_rank%nthreads) != 0);
-    // if (nblocks * nthreads < batch_size_cur_rank) {
-    //     puts("ERROR: nblocks * nthreads < batch_size_cur_rank");
-    //     return;
-    // }
-    calculate_local_energy_kernel<<<nblocks, nthreads>>>(
-
-    // const int nthreads = 32;
-    // // const int nblocks = MIN(108, batch_size_cur_rank);
-    // const int nblocks = batch_size_cur_rank;
-
-    // const dim3 nthreads(32, 32);
-    // const int nblocks = batch_size_cur_rank;
-    // calculate_local_energy_kernel_V1<<<nblocks, nthreads>>>(
-        n_qubits,
-        g_NK,
-        idxs,
-        coeffs,
-        pauli_mat12,
-        pauli_mat23,
-        batch_size,
-        batch_size_cur_rank,
-        ist,
-        &d_states[ist*N],
-        d_ks,
-        d_vs,
-        eps,
-        d_res_eloc_batch);
-    cudaCheckErrors("kernel launch failure");
-    cudaDeviceSynchronize();
-    cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
-    cudaCheckErrors("cudaMemcpy failure");
-    timer[2].stop("local_energy_kernel");
-
-    free(states);
-    cudaFree(d_states);
-    cudaFree(d_res_eloc_batch);
-    cudaFree(d_ks);
-    cudaFree(d_vs);
-    timer[3].stop("Cuda calculate_local_energy");
-}
-#endif
-
 void calculate_local_energy_sampling_parallel(
     const int64 all_batch_size,
     const int64 batch_size,
@@ -2562,7 +1581,6 @@ void calculate_local_energy_sampling_parallel(
     cudaFree(d_vs);
 }
 
-#ifdef BIT_ARRAY_OPT
 void calculate_local_energy_sampling_parallel_bigInt(
     const int64 all_batch_size,
     const int64 batch_size,
@@ -2626,6 +1644,7 @@ void calculate_local_energy_sampling_parallel_bigInt(
     const int nthreads = 128;
     const int nblocks = batch_size_cur_rank / nthreads + ((batch_size_cur_rank%nthreads) != 0);
     // calculate_local_energy_kernel_bigInt<<<nblocks, nthreads>>>(
+    nvtxRangePushA("lck");
     if (n_qubits <= 32) {
         calculate_local_energy_kernel_bigInt_V1_bitarr<32><<<nblocks, nthreads>>>(
             num_uint32,
@@ -2698,7 +1717,7 @@ void calculate_local_energy_sampling_parallel_bigInt(
     } else {
         printf("Error: only support n_qubits <= 128\n");
     }
-
+    nvtxRangePop();
     cudaCheckErrors("kernel launch failure");
     cudaDeviceSynchronize();
     cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
@@ -2711,106 +1730,3 @@ void calculate_local_energy_sampling_parallel_bigInt(
     cudaFree(d_ks);
     cudaFree(d_vs);
 }
-#else
-void calculate_local_energy_sampling_parallel_bigInt(
-    const int64 all_batch_size,
-    const int64 batch_size,
-    const int64 *_states,
-    const int64 ist,
-    const int64 ied,
-    const int64 ks_disp_idx,
-    const uint64 *ks,
-    const int64 id_width,
-    const psi_dtype *vs,
-    const int64 rank,
-    const float64 eps,
-    psi_dtype *res_eloc_batch)
-{
-    printf("ORG BigInt\n");
-    Timer timer[4];
-
-    const int32 n_qubits = g_n_qubits;
-    const int64 *idxs = g_idxs;
-    const coeff_dtype *coeffs = g_coeffs;
-    const dtype *pauli_mat12 = g_pauli_mat12;
-    const dtype *pauli_mat23 = g_pauli_mat23;
-
-    const int64 batch_size_cur_rank = ied - ist;
-    const int32 N = g_n_qubits;
-
-    timer[0].start();
-    // transform _states{int64} into states{dtype} and map {+1,-1} to {+1,0}
-    // assume states id is ordered after unique sampling, for using binary find
-    const int64 target_value = -1;
-    const size_t size_states = sizeof(dtype) * batch_size * N;
-    dtype *states = NULL, *d_states = NULL;
-    states = (dtype *)malloc(size_states);
-    memset(states, 0, size_states); // init 0
-    for (int i = 0; i < batch_size; i++) {
-        for (int j = 0; j < N; j++) {
-            if (_states[i*N+j] != target_value) {
-                states[i*N+j] = 1;
-            }
-        }
-    }
-    timer[0].stop("convert_states");
-
-    const size_t size_ks = sizeof(uint64) * all_batch_size * id_width;
-    const size_t size_vs = sizeof(psi_dtype) * all_batch_size * 2;
-    const size_t size_res_eloc_batch = sizeof(psi_dtype) * batch_size_cur_rank * 2;
-    uint64 *d_ks = NULL;
-    psi_dtype *d_vs = NULL;
-    psi_dtype *d_res_eloc_batch = NULL;
-
-    cudaMalloc(&d_ks, size_ks);
-    cudaMalloc(&d_vs, size_vs);
-    cudaMalloc(&d_states, size_states);
-    cudaMalloc(&d_res_eloc_batch, size_res_eloc_batch);
-    cudaCheckErrors("cudaMalloc failure");
-    cudaMemcpy(d_ks, ks, size_ks, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vs, vs, size_vs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_states, states, size_states, cudaMemcpyHostToDevice);
-    cudaCheckErrors("cudaMemcpy failure");
-    
-    // printf("rank: %d all_batch_size: %d, batch_size: %d ks_disp_idx: %d batch_size_cur_rank: %d\n", rank, all_batch_size, batch_size, ks_disp_idx, batch_size_cur_rank);
-    // if (rank == 0) {
-    //     for (int i = 0; i < all_batch_size; i++) {
-    //         printf("ks[%ld]=%ld, vs=(%f, %f)\n", i, ks[i], vs[i*2], vs[i*2+1]);
-    //     }
-    // }
-    // puts("\n");
-
-    timer[1].start();
-    // int nthreads = 256;
-    const int nthreads = 128;
-    const int nblocks = batch_size_cur_rank / nthreads + ((batch_size_cur_rank%nthreads) != 0);
-    calculate_local_energy_kernel_bigInt<<<nblocks, nthreads>>>(
-    // calculate_local_energy_kernel_bigInt_V1<<<nblocks, nthreads>>>(
-        n_qubits,
-        g_NK,
-        idxs,
-        coeffs,
-        pauli_mat12,
-        pauli_mat23,
-        all_batch_size,
-        batch_size_cur_rank,
-        ks_disp_idx,
-        &d_states[ist*N],
-        d_ks,
-        id_width,
-        d_vs,
-        eps,
-        d_res_eloc_batch);
-    cudaCheckErrors("kernel launch failure");
-    cudaDeviceSynchronize();
-    cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
-    cudaCheckErrors("cudaMemcpy failure");
-    timer[1].stop("bigIntOrg: local_energy_kernel");
-
-    free(states);
-    cudaFree(d_states);
-    cudaFree(d_res_eloc_batch);
-    cudaFree(d_ks);
-    cudaFree(d_vs);
-}
-#endif
