@@ -55,8 +55,6 @@ struct ValueT{
     psi_dtype data[2];
 };
 
-#define ValueBytes (2*sizeof(psi_dtype))
-
 
 __device__ __host__ int myHashFunc(KeyT value, int threshold) {
     //BKDR hash
@@ -84,14 +82,15 @@ __device__ __host__ int myHashFunc(KeyT value, int threshold) {
     //return ((value & 0xff)+((value>>8) & 0xff)+((value>>16) &0xff)+((value >> 24)&0xff))%threshold;
 
 }
-
+#define _len 16
 __device__ __host__ int hashFunc1(KeyT value, int threshold) {
      
     int p = 16777619;
     int hash = (int)2166136261L;
-    int len = sizeof(KeyT);
+    //int _len = sizeof(KeyT);
     char *values = static_cast<char*>(value.data);
-    for (int i = 0; i < len; i ++)
+#pragma unroll
+    for (int i = 0; i < _len; i ++)
             hash = (hash ^ values[i]) * p;
     hash += hash << 13;
     hash ^= hash >> 7;
@@ -102,22 +101,33 @@ __device__ __host__ int hashFunc1(KeyT value, int threshold) {
 }
 
 __device__ __host__ int hashFunc2(KeyT value, int threshold) {
-    int len = sizeof(KeyT);
+    /*int len = sizeof(KeyT);
     char *values = static_cast<char*>(value.data);
     int hash = 324223113;
     for (int i = 0; i < len; i ++) 
         hash = (hash<<4)^(hash>>28)^values[i];
+    return (hash & 0x7FFFFFFF) % threshold;*/
+
+    unsigned int seed = 12313;
+    char* values = static_cast<char*>(value.data);
+    //int _len = sizeof(KeyT);
+    unsigned int hash = 711371;
+#pragma unroll
+    for (int i = _len; i > 0; i --) {
+        char v = (~values[i-1])*(i&1) + (values[i-1])*(~(i&1));
+        hash = hash * seed + (v&0xF);
+    }
     return (hash & 0x7FFFFFFF) % threshold;
 }
 
 __device__ __host__ int hashFunc3(KeyT value, int threshold) {
-    int len = sizeof(KeyT);
+    //int _len = sizeof(KeyT);
     char *values = static_cast<char*>(value.data);
     int b    = 378551;
     int a    = 63689;
     int hash = 0;
-
-    for(int i = 0; i < len; i++)
+#pragma unroll
+    for(int i = 0; i < _len; i++)
     {
       hash = hash * a + values[i];
       a    = a * b;
@@ -127,7 +137,7 @@ __device__ __host__ int hashFunc3(KeyT value, int threshold) {
 }
 
 
-#define BFT int32_t
+#define BFT uint32_t
 struct myHashTable {
     KeyT* keys;
     ValueT* values;
@@ -141,9 +151,9 @@ struct myHashTable {
         KeyT* list = keys + (int64_t)hashvalue*bSize;
         int thre = sizeof(BFT)*8;
         BFT my_bf = bf[hashvalue];
-        if (!((my_bf>>hashFunc1(key, thre))&1))
-            //|| !((my_bf>>hashFunc2(key, thre))&1)
-            //|| !((my_bf>>hashFunc3(key, thre))&1)) 
+        if (!((my_bf>>hashFunc1(key, thre))&1)
+            || !((my_bf>>hashFunc2(key, thre))&1) 
+            || !((my_bf>>hashFunc3(key, thre))&1)) 
             {
                 filtered ++;
                 return -1;
@@ -194,10 +204,10 @@ __global__ void build_hashtable_bf_kernel(myHashTable ht) {
             KeyT my_value = keys[bid * bucket_size + e];
             int hv = hashFunc1(my_value, sizeof(BFT)*8);
             my_bf |= (1<<hv);
-            //hv = hashFunc2(my_value, sizeof(BFT)*8);
-            //my_bf |= (1<<hv);
-            //hv = hashFunc3(my_value, sizeof(BFT)*8);
-            //my_bf |= (1<<hv);
+            hv = hashFunc2(my_value, sizeof(BFT)*8);
+            my_bf |= (1<<hv);
+            hv = hashFunc3(my_value, sizeof(BFT)*8);
+            my_bf |= (1<<hv);
         }
         ht.bf[bid] = my_bf;
     }

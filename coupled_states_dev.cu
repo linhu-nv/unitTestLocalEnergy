@@ -545,7 +545,7 @@ void calculate_local_energy_sampling_parallel_bigInt(
 
     //TODO:build hash table
     
-    float avg2cacheline = 0.7;
+    float avg2cacheline = 0.5;
     float avg2bsize = 0.55;
 
     int cacheline_size = 128/sizeof(KeyT);
