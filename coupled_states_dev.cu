@@ -348,20 +348,18 @@ __global__ void calculate_local_energy_kernel_bigInt_V1_bitarr(
     const psi_dtype *vs,
     const float64 eps,
     psi_dtype *res_eloc_batch,
-    myHashTable ht,
-    long *found,
-    long *missed)
+    myHashTable ht)
 {
     const int32 N = num_uint32;
     const int32 index = blockIdx.x * blockDim.x + threadIdx.x;
     const int32 stride = gridDim.x * blockDim.x;
 
     uint64 big_id[ID_WIDTH];
-    int myfound = 0;
-    int mymissed = 0;
+    //int myfound = 0;
+    //int mymissed = 0;
 
-    float64 clks[4] = {0};
-    clock_t t_st, t_ed;
+    //float64 clks[4] = {0};
+    //clock_t t_st, t_ed;
 
     // loop all samples
     for (int ii = index; ii < batch_size_cur_rank; ii+=stride) {
@@ -370,13 +368,13 @@ __global__ void calculate_local_energy_kernel_bigInt_V1_bitarr(
             psi_dtype psi_real = 0., psi_imag = 0.;
             // map state -> id
             // int64 j_base = sid * N;
-            int res = 0xffff;
+            //int res = 0xffff;
             // int64 id = 0;
             // for (int ik = 0; ik < N; ik++) {
             //     id += (state_batch[ii*N+ik] ^ pauli_mat12[j_base+ik])*tbl_pow2[ik];
             // }
             // _state2id_huge_fuse(&state_batch[ii*N], &pauli_mat12[j_base], N, id_width, id_stride, tbl_pow2, big_id);
-            t_st = clock();
+            //t_st = clock();
             big_id[0] = state_batch[ii*N] ^ pauli_mat12[sid*N];
             if (MAXN >= 64) {
                 big_id[0] = ((uint64)(state_batch[ii*N+1] ^ pauli_mat12[sid*N+1]) << 32) | big_id[0];
@@ -387,38 +385,31 @@ __global__ void calculate_local_energy_kernel_bigInt_V1_bitarr(
             if (MAXN >= 128) {
                 big_id[1] = ((uint64)(state_batch[ii*N+3] ^ pauli_mat12[sid*N+3]) << 32) | big_id[1];
             }
-            t_ed = clock();
-            clks[0] += static_cast<float64>(t_ed - t_st);
+            //t_ed = clock();
+            //clks[0] += static_cast<float64>(t_ed - t_st);
             // binary find id among the sampled samples
             // idx = binary_find(ks, id), [_ist, _ied) start from 0
-            int32 _ist = 0, _ied = batch_size;
-            t_st = clock();
+            //int32 _ist = 0, _ied = batch_size;
+            //t_st = clock();
             
             //binary_find_bigInt(_ist, _ied, ks, vs, id_width, big_id, &psi_real, &psi_imag, &res);
             KeyT key(big_id[0], big_id[1]);
 
-            int64_t off = ht.search_key(key, myfound);
+            int64_t off = ht.search_key(key);
 
             if (off != -1) {
-                res = 0;
                 psi_real = ht.values[off].data[0];
                 psi_imag = ht.values[off].data[1];
-            } 
-            t_ed = clock();
-            clks[1] += static_cast<float64>(t_ed - t_st);
-            // printf("index: %d big_id[0]: %llu res: %d\n", index, big_id[0], res);
-
-            // don't find this coupled state in current samples
-            if (res != 0) {
-                mymissed ++;
-                continue;
             } else {
-                //myfound ++;
+                continue;
             }
+            //t_ed = clock();
+            //clks[1] += static_cast<float64>(t_ed - t_st);
+            // printf("index: %d big_id[0]: %llu res: %d\n", index, big_id[0], res);
 
             coeff_dtype coef = 0.0;
 
-            t_st = clock();
+            //t_st = clock();
             int st = idxs[sid], ed = idxs[sid+1];
             for (int i = st; i < ed; i++) {
                 // int _sum = 0;
@@ -442,8 +433,8 @@ __global__ void calculate_local_energy_kernel_bigInt_V1_bitarr(
                 coef += _sgn * coeffs[i];
                 // i_base += N;
             }
-            t_ed = clock();
-            clks[2] += static_cast<float64>(t_ed - t_st);
+            //t_ed = clock();
+            //clks[2] += static_cast<float64>(t_ed - t_st);
             // if (FABS(coef) < eps) continue;
             e_loc_real += coef * psi_real;
             e_loc_imag += coef * psi_imag;
@@ -451,7 +442,7 @@ __global__ void calculate_local_energy_kernel_bigInt_V1_bitarr(
             // printf("ii: %d coef: %f\n", ii, coef);
             // printf("ii=%d e_loc_real=%f\n", ii, e_loc_real);
         }
-        t_st = clock();
+        //t_st = clock();
         // store the result number as return
         // (a+bi)/(c+di) = (ac+bd)/(c^2+d^2) + (bc-ad)/(c^2+d^2)i
         const psi_dtype a = e_loc_real, b = e_loc_imag;
@@ -460,19 +451,11 @@ __global__ void calculate_local_energy_kernel_bigInt_V1_bitarr(
         res_eloc_batch[ii*2  ] = (a*c + b*d) / c2_d2;
         // res_eloc_batch[ii*2+1] = (a*d - b*c) / c2_d2;
         res_eloc_batch[ii*2+1] = -(a*d - b*c) / c2_d2;
-        t_ed = clock();
-        clks[3] += static_cast<float64>(t_ed - t_st);
+        //t_ed = clock();
+        //clks[3] += static_cast<float64>(t_ed - t_st);
     }
-    myfound += __shfl_down_sync(0xffffffff, myfound, 1); mymissed += __shfl_down_sync(0xffffffff, mymissed, 1);
-    myfound += __shfl_down_sync(0xffffffff, myfound, 2); mymissed += __shfl_down_sync(0xffffffff, mymissed, 2);
-    myfound += __shfl_down_sync(0xffffffff, myfound, 4); mymissed += __shfl_down_sync(0xffffffff, mymissed, 4);
-    myfound += __shfl_down_sync(0xffffffff, myfound, 8); mymissed += __shfl_down_sync(0xffffffff, mymissed, 8);
-    myfound += __shfl_down_sync(0xffffffff, myfound, 16); mymissed += __shfl_down_sync(0xffffffff, mymissed, 16);
-    if (threadIdx.x%32 == 0) {
-        found[index/32] = myfound;
-        missed[index/32] = mymissed;
-    }
-    float64 _sum = clks[0] + clks[1] + clks[2] + clks[3];
+    
+    //float64 _sum = clks[0] + clks[1] + clks[2] + clks[3];
     //if (threadIdx.x == 0)
     //printf("tid: %d clks: %.3lf %.3lf %.3f %.3f\n", index, clks[0]/_sum, clks[1]/_sum, clks[2]/_sum, clks[3]/_sum);
 }
@@ -545,7 +528,7 @@ void calculate_local_energy_sampling_parallel_bigInt(
 
     //TODO:build hash table
     
-    float avg2cacheline = 0.5;
+    float avg2cacheline = 0.3;
     float avg2bsize = 0.55;
 
     int cacheline_size = 128/sizeof(KeyT);
@@ -561,13 +544,13 @@ void calculate_local_energy_sampling_parallel_bigInt(
         printf("Build hash table failed! The avg2bsize is %f now. Rebuilding... ...\n", avg2bsize);
     }
 
-    long *found, *missed;
+    /*long *found, *missed;
     cudaMalloc((void **)&found, sizeof(long)*nblocks*4);
     cudaMalloc((void **)&missed, sizeof(long)*nblocks*4);
     cudaMemset(found, 0, sizeof(long)*nblocks*4);
-    cudaMemset(found, 0, sizeof(long)*nblocks*4);
+    cudaMemset(found, 0, sizeof(long)*nblocks*4);*/
 
-    nvtxRangePushA("lck");
+    //nvtxRangePushA("lck");
     if (n_qubits <= 32) {
         calculate_local_energy_kernel_bigInt_V1_bitarr<32><<<nblocks, nthreads>>>(
             num_uint32,
@@ -585,9 +568,9 @@ void calculate_local_energy_sampling_parallel_bigInt(
             d_vs,
             eps,
             d_res_eloc_batch,
-            ht,
-            found,
-            missed);
+            ht);
+            //found,
+            //missed);
     } else if (n_qubits <= 64) {
         calculate_local_energy_kernel_bigInt_V1_bitarr<64><<<nblocks, nthreads>>>(
             num_uint32,
@@ -605,9 +588,9 @@ void calculate_local_energy_sampling_parallel_bigInt(
             d_vs,
             eps,
             d_res_eloc_batch,
-            ht,
-            found,
-            missed);
+            ht);
+            //found,
+            //missed);
     } else if (n_qubits <= 96) {
         calculate_local_energy_kernel_bigInt_V1_bitarr<96><<<nblocks, nthreads>>>(
         // calculate_local_energy_kernel_bigInt_bitarr<96><<<nblocks, nthreads>>>(
@@ -626,9 +609,9 @@ void calculate_local_energy_sampling_parallel_bigInt(
             d_vs,
             eps,
             d_res_eloc_batch,
-            ht,
-            found,
-            missed);
+            ht);
+            //found,
+            //missed);
     } else if (n_qubits <= 128) {
         calculate_local_energy_kernel_bigInt_V1_bitarr<128><<<nblocks, nthreads>>>(
             num_uint32,
@@ -646,22 +629,22 @@ void calculate_local_energy_sampling_parallel_bigInt(
             d_vs,
             eps,
             d_res_eloc_batch,
-            ht,
-            found,
-            missed);
+            ht);
+            //found,
+            //missed);
     } else {
         printf("Error: only support n_qubits <= 128\n");
     }
-    nvtxRangePop();
+    //nvtxRangePop();
     cudaCheckErrors("kernel launch failure");
     cudaDeviceSynchronize();
     freeHashTable(ht);
-    long found_total = thrust::reduce(thrust::device, found, found + nblocks*4);
-    long missed_total = thrust::reduce(thrust::device, missed, missed + nblocks*4);
+    /*long found_total = thrust::reduce(thrust::device, found, found + nblocks*4);
+    long missed_total = thrust::reduce(thrust::device, missed, missed + nblocks*4);*/
     cudaMemcpy(res_eloc_batch, d_res_eloc_batch, size_res_eloc_batch, cudaMemcpyDeviceToHost);
     cudaCheckErrors("cudaMemcpy failure");
     timer[2].stop("bigIntBitarray: local_energy_kernel");
-    printf("total missed is %ld, total found is %ld\n", missed_total, found_total);
+    //printf("total missed is %ld, total found is %ld\n", missed_total, found_total);
     printf("batchsize is %d, g_nk is %d, id_width is %d\n", batch_size_cur_rank, g_NK, id_width);
 
     free(states);
@@ -669,6 +652,6 @@ void calculate_local_energy_sampling_parallel_bigInt(
     cudaFree(d_res_eloc_batch);
     cudaFree(d_ks);
     cudaFree(d_vs);
-    cudaFree(found);
-    cudaFree(missed);
+    //cudaFree(found);
+    //cudaFree(missed);
 }
